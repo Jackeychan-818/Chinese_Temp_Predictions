@@ -1,0 +1,12 @@
+# Ignore everything by default
+*
+
+# Allow Git metadata and documentation
+!.gitignore
+!README.md
+
+# Allow R scripts
+!*.R
+
+# Allow directories so .R files in subfolders can be tracked
+!*/
