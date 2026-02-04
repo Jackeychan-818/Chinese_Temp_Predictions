@@ -8,5 +8,8 @@
 # Allow R scripts
 !*.R
 
+# Allow Python scripts
+!*.py
+
 # Allow directories so .R files in subfolders can be tracked
 !*/
