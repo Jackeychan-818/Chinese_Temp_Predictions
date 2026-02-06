@@ -27,7 +27,7 @@ from pyproj import Transformer
 
 DATA_PATH = "/Users/jackey/Desktop/Kriging/Corrected_City-Specific_Weekly_Temperature_Differences_with_Location.xlsx"
 GRID_PATH = "/Users/jackey/Desktop/Kriging/china_grid2.xlsx"
-OUTPUT_DIR = "/Users/jackey/Desktop/Chinese_Temp_Predictions/Results/Map_Only"
+OUTPUT_DIR = "/Users/jackey/Desktop/Chinese_Temp_Predictions/Python_Results"
 
 WEEKS = range(22, 35)  # 22–34 inclusive
 
@@ -39,8 +39,8 @@ def require_columns(df: pd.DataFrame, required: list[str], label: str) -> None:
 
 
 def main() -> None:
-    data = pd.read_excel(DATA_PATH)
-    grid = pd.read_excel(GRID_PATH)
+    data = pd.read_excel(DATA_PATH, engine="calamine")
+    grid = pd.read_excel(GRID_PATH, engine="calamine")
 
     require_columns(data, ["week_number", "longitude", "latitude", "temp_diff"], "data")
     require_columns(grid, ["longitude", "latitude"], "grid")
