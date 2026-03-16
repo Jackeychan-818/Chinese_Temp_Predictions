@@ -8,6 +8,7 @@ with a static CSV fallback from sfyc23/China-zip-code-latitude-and-longitude.
 from __future__ import annotations
 
 import csv
+import re
 import ssl
 import urllib.request
 from collections import defaultdict
@@ -17,7 +18,8 @@ import pandas as pd
 
 import cpca
 
-INPUT_FILE = Path("/Users/jackey/Desktop/Chinese_Temp_Predictions/real_city_districts_parsed.xlsx")
+INPUT_FILE = Path("/Users/jackey/Desktop/Chinese_Temp_Predictions/unique_city_districts.xlsx")
+PARSED_FILE = Path("/Users/jackey/Desktop/Chinese_Temp_Predictions/real_city_districts_parsed.xlsx")
 OUTPUT_FILE = Path("/Users/jackey/Desktop/Chinese_Temp_Predictions/geocoded_city_districts.xlsx")
 FALLBACK_CSV = Path("/Users/jackey/Desktop/Chinese_Temp_Predictions/region_geo_cache.csv")
 FALLBACK_URL = (
@@ -106,6 +108,100 @@ ADMIN_SUFFIXES = [
     "林区", "矿区", "特区",
     "新区", "开发区",
 ]
+
+# Org suffixes to strip from raw unit names for direct geocoding attempts.
+ORG_SUFFIXES = [
+    "客户服务分中心",
+    "供电服务中心",
+    "供配电中心",
+    "供电分公司",
+    "供电分局",
+    "供电中心",
+    "供电公司",
+    "供电支公司",
+    "供电所",
+    "服务所",
+    "电力局",
+    "电力公司",
+    "电力有限公司",
+    "电力有限责任公司",
+    "有限责任公司",
+    "有限公司",
+    "分公司",
+    "中心",
+]
+
+# Patterns that indicate a non-geocodable junk entry.
+JUNK_PATTERNS = [
+    "供电区域",
+    "供电分中心",
+    "供电部",
+    "大客户",
+    "自备电厂",
+    "公司本部",
+    "局直",
+    "本部",
+    "（删",
+    "(删",
+    "待删除",
+    "删除",
+    "暂停",
+]
+
+# Regex to extract city+district from names like "上饶市信州区供电分公司",
+# "国网冀北唐山市丰南区供电公司", "南昌市红谷滩供电分公司" etc.
+_CITY_DISTRICT_RE = re.compile(
+    r"(?:国网|南方电网)?(?:冀北|蒙东)?"
+    r"(.{2,6}?[市州])"          # city part
+    r"(.{2,6}?[区县市旗])"      # district part
+    r"(?:供电|配售电|电力)"
+)
+
+# Regex for simpler names like "东营区供电公司" where the name IS the district
+_DIRECT_DISTRICT_RE = re.compile(
+    r"^(.{2,8}?[区县市旗州盟])"
+    r"(?:供电|配售电|电力|客户)"
+)
+
+
+def is_junk_entry(name: str) -> bool:
+    """Check if a name is a non-geocodable junk/admin entry."""
+    return any(p in name for p in JUNK_PATTERNS)
+
+
+def extract_district_from_raw(raw_name: str) -> tuple[str, str] | None:
+    """Try to extract a district name directly from a raw unit name.
+
+    Returns (district_name_with_suffix, city_name) or None.
+    """
+    # Try city+district pattern first
+    m = _CITY_DISTRICT_RE.search(raw_name)
+    if m:
+        return m.group(2), m.group(1)
+
+    # Try direct district pattern (e.g. "东营区供电公司")
+    m = _DIRECT_DISTRICT_RE.match(raw_name)
+    if m:
+        return m.group(1), ""
+
+    return None
+
+
+def strip_org_suffix(raw_name: str) -> str:
+    """Strip organizational suffixes to get the place name core."""
+    # Remove common prefixes
+    text = raw_name
+    for prefix in ["国网", "南方电网"]:
+        if text.startswith(prefix):
+            text = text[len(prefix):]
+
+    # Remove org suffixes (longest first)
+    for suffix in ORG_SUFFIXES:
+        if text.endswith(suffix):
+            text = text[: -len(suffix)]
+            break
+
+    return text.strip()
 
 
 def normalize_province(province_raw: str) -> str:
@@ -348,6 +444,8 @@ def geocode_name(
 def main() -> None:
     if not INPUT_FILE.exists():
         raise FileNotFoundError(f"Input file not found: {INPUT_FILE}")
+    if not PARSED_FILE.exists():
+        raise FileNotFoundError(f"Parsed file not found: {PARSED_FILE}")
 
     # Build lookups
     print("Building cpca lookup ...")
@@ -359,137 +457,255 @@ def main() -> None:
     fallback_lookup = build_fallback_lookup(FALLBACK_CSV)
     print(f"  {len(fallback_lookup)} unique names in fallback CSV")
 
-    # Read parsed data
-    city_df = pd.read_excel(INPUT_FILE, sheet_name="Parsed_City_Units")
-    district_df = pd.read_excel(INPUT_FILE, sheet_name="Parsed_District_Units")
+    # Read input data (original unit names)
+    unique_cities = pd.read_excel(INPUT_FILE, sheet_name="Unique_Cities")
+    unique_districts = pd.read_excel(INPUT_FILE, sheet_name="Unique_Districts")
+    city_district_pairs = pd.read_excel(INPUT_FILE, sheet_name="City_District_Pairs")
 
-    # --- Geocode cities ---
+    # Read parsed data to build raw_name -> (parsed_name, province) mapping
+    parsed_city_df = pd.read_excel(PARSED_FILE, sheet_name="Parsed_City_Units")
+    parsed_dist_df = pd.read_excel(PARSED_FILE, sheet_name="Parsed_District_Units")
+
+    # Build city mapping: raw_city_unit -> (parsed_city_name, 省公司)
+    city_parsed_map: dict[str, tuple[str, str]] = {}
+    for _, row in parsed_city_df.iterrows():
+        raw = row["raw_city_unit"]
+        if raw not in city_parsed_map and row["city_parse_status"] == "ok":
+            city_parsed_map[raw] = (row["parsed_city_name"], row["省公司"])
+
+    # Build district mapping: (raw_city_unit, raw_district_unit) -> (parsed_district_name, parsed_city_name, 省公司)
+    dist_parsed_map: dict[tuple[str, str], tuple[str, str, str]] = {}
+    for _, row in parsed_dist_df.iterrows():
+        key = (row["raw_city_unit"], row["raw_district_unit"])
+        if key not in dist_parsed_map and row["district_parse_status"] == "ok":
+            dist_parsed_map[key] = (
+                row["parsed_district_name"],
+                row["parsed_city_name"] if pd.notna(row["parsed_city_name"]) else "",
+                row["省公司"],
+            )
+
+    # --- Geocode Unique_Cities ---
     print("\nGeocoding cities ...")
-    city_ok = city_df[city_df["city_parse_status"] == "ok"].copy()
-    city_unique = (
-        city_ok[["省公司", "parsed_city_name"]]
-        .drop_duplicates()
-        .reset_index(drop=True)
-    )
-
     city_rows = []
-    for _, row in city_unique.iterrows():
-        name = row["parsed_city_name"]
-        province_hint = normalize_province(row["省公司"])
-        result = geocode_name(name, province_hint, cpca_lookup, fallback_lookup, prefer_rank=1)
-        if result:
-            lat, lng, source = result
+    for _, row in unique_cities.iterrows():
+        raw_name = row["地市供电单位名称"]
+
+        # Check junk
+        if is_junk_entry(raw_name):
             city_rows.append({
-                "parsed_city_name": name,
-                "province": province_hint,
-                "latitude": lat,
-                "longitude": lng,
-                "match_source": source,
-            })
-        else:
-            city_rows.append({
-                "parsed_city_name": name,
-                "province": province_hint,
+                "地市供电单位名称": raw_name,
                 "latitude": None,
                 "longitude": None,
-                "match_source": "unmatched",
+                "match_source": "junk",
             })
+            continue
 
-    city_coords_df = pd.DataFrame(city_rows)
-    city_matched = city_coords_df[city_coords_df["latitude"].notna()]
-    city_unmatched = city_coords_df[city_coords_df["latitude"].isna()]
-    print(f"  Cities matched: {len(city_matched)} / {len(city_coords_df)}")
+        # Strategy A: use parsed mapping
+        mapping = city_parsed_map.get(raw_name)
+        if mapping:
+            parsed_name, province_raw = mapping
+            province_hint = normalize_province(province_raw)
+            result = geocode_name(parsed_name, province_hint, cpca_lookup, fallback_lookup, prefer_rank=1)
+            if result:
+                lat, lng, source = result
+                city_rows.append({
+                    "地市供电单位名称": raw_name,
+                    "latitude": lat,
+                    "longitude": lng,
+                    "match_source": source,
+                })
+                continue
 
-    # --- Geocode districts ---
+        # Strategy B: try stripping org suffix from raw name and geocoding directly
+        stripped = strip_org_suffix(raw_name)
+        if stripped and len(stripped) >= 2:
+            province_hint = ""
+            if mapping:
+                province_hint = normalize_province(mapping[1])
+            result = geocode_name(stripped, province_hint, cpca_lookup, fallback_lookup, prefer_rank=1)
+            if result:
+                lat, lng, source = result
+                city_rows.append({
+                    "地市供电单位名称": raw_name,
+                    "latitude": lat,
+                    "longitude": lng,
+                    "match_source": f"raw_strip:{source}",
+                })
+                continue
+
+        city_rows.append({
+            "地市供电单位名称": raw_name,
+            "latitude": None,
+            "longitude": None,
+            "match_source": "no_parse" if not mapping else "unmatched",
+        })
+
+    city_out_df = pd.DataFrame(city_rows)
+    city_matched_count = city_out_df["latitude"].notna().sum()
+    print(f"  Cities matched: {city_matched_count} / {len(city_out_df)}")
+
+    # Build city coord lookup for fallback use later
+    city_coord_map: dict[str, tuple[float, float, str]] = {}
+    for _, r in city_out_df[city_out_df["latitude"].notna()].iterrows():
+        city_coord_map[r["地市供电单位名称"]] = (r["latitude"], r["longitude"], r["match_source"])
+
+    # --- Geocode Unique_Districts ---
     print("Geocoding districts ...")
-    dist_ok = district_df[district_df["district_parse_status"] == "ok"].copy()
-    dist_unique = (
-        dist_ok[["省公司", "parsed_city_name", "parsed_district_name"]]
-        .drop_duplicates()
-        .reset_index(drop=True)
-    )
+    # Build district -> list of cities from the pairs sheet.
+    dist_to_cities: dict[str, list[str]] = defaultdict(list)
+    for _, row in city_district_pairs.iterrows():
+        dist_to_cities[row["区县供电单位名称"]].append(row["地市供电单位名称"])
 
     dist_rows = []
-    for _, row in dist_unique.iterrows():
-        name = row["parsed_district_name"]
-        city_name = row["parsed_city_name"] if pd.notna(row["parsed_city_name"]) else ""
-        province_hint = normalize_province(row["省公司"])
-        result = geocode_name(name, province_hint, cpca_lookup, fallback_lookup, prefer_rank=2)
+    for _, row in unique_districts.iterrows():
+        raw_dist = row["区县供电单位名称"]
+
+        # Check junk
+        if is_junk_entry(raw_dist):
+            dist_rows.append({
+                "区县供电单位名称": raw_dist,
+                "latitude": None,
+                "longitude": None,
+                "match_source": "junk",
+            })
+            continue
+
+        # Gather province hint from any associated city
+        province_hint = ""
+        for raw_city in dist_to_cities.get(raw_dist, []):
+            key = (raw_city, raw_dist)
+            mapping = dist_parsed_map.get(key)
+            if mapping:
+                province_hint = normalize_province(mapping[2])
+                break
+
+        # Strategy A: use parsed mapping (original approach)
+        result = None
+        for raw_city in dist_to_cities.get(raw_dist, []):
+            key = (raw_city, raw_dist)
+            mapping = dist_parsed_map.get(key)
+            if mapping:
+                parsed_dist_name = mapping[0]
+                prov = normalize_province(mapping[2])
+                result = geocode_name(parsed_dist_name, prov, cpca_lookup, fallback_lookup, prefer_rank=2)
+                if result:
+                    break
+
         if result:
             lat, lng, source = result
             dist_rows.append({
-                "parsed_district_name": name,
-                "parsed_city_name": city_name,
-                "province": province_hint,
+                "区县供电单位名称": raw_dist,
                 "latitude": lat,
                 "longitude": lng,
                 "match_source": source,
             })
-        else:
+            continue
+
+        # Strategy B: extract city+district directly from raw name
+        # e.g. "上饶市信州区供电分公司" -> district="信州区"
+        extracted = extract_district_from_raw(raw_dist)
+        if extracted:
+            dist_name, city_name = extracted
+            result = geocode_name(dist_name, province_hint, cpca_lookup, fallback_lookup, prefer_rank=2)
+            if result:
+                lat, lng, source = result
+                dist_rows.append({
+                    "区县供电单位名称": raw_dist,
+                    "latitude": lat,
+                    "longitude": lng,
+                    "match_source": f"extract_raw:{source}",
+                })
+                continue
+
+        # Strategy C: strip org suffix from raw name and try geocoding
+        stripped = strip_org_suffix(raw_dist)
+        if stripped and len(stripped) >= 2:
+            result = geocode_name(stripped, province_hint, cpca_lookup, fallback_lookup, prefer_rank=2)
+            if result:
+                lat, lng, source = result
+                dist_rows.append({
+                    "区县供电单位名称": raw_dist,
+                    "latitude": lat,
+                    "longitude": lng,
+                    "match_source": f"raw_strip:{source}",
+                })
+                continue
+
+        # Strategy D: fall back to parent city coordinates
+        city_fallback = None
+        for raw_city in dist_to_cities.get(raw_dist, []):
+            if raw_city in city_coord_map:
+                city_fallback = city_coord_map[raw_city]
+                break
+
+        if city_fallback:
+            lat, lng, csource = city_fallback
             dist_rows.append({
-                "parsed_district_name": name,
-                "parsed_city_name": city_name,
-                "province": province_hint,
-                "latitude": None,
-                "longitude": None,
-                "match_source": "unmatched",
+                "区县供电单位名称": raw_dist,
+                "latitude": lat,
+                "longitude": lng,
+                "match_source": f"city_fallback:{csource}",
             })
+            continue
 
-    dist_coords_df = pd.DataFrame(dist_rows)
-    dist_matched = dist_coords_df[dist_coords_df["latitude"].notna()]
-    dist_unmatched = dist_coords_df[dist_coords_df["latitude"].isna()]
-    print(f"  Districts matched: {len(dist_matched)} / {len(dist_coords_df)}")
+        dist_rows.append({
+            "区县供电单位名称": raw_dist,
+            "latitude": None,
+            "longitude": None,
+            "match_source": "unmatched",
+        })
 
-    # --- Combine unmatched ---
-    unmatched_rows = []
-    for _, row in city_unmatched.iterrows():
-        unmatched_rows.append({
-            "level": "city",
-            "parsed_name": row["parsed_city_name"],
-            "province": row["province"],
+    dist_out_df = pd.DataFrame(dist_rows)
+    dist_matched_count = dist_out_df["latitude"].notna().sum()
+    dist_junk_count = (dist_out_df["match_source"] == "junk").sum()
+    dist_city_fb_count = dist_out_df["match_source"].str.startswith("city_fallback").sum()
+    dist_extract_count = dist_out_df["match_source"].str.startswith("extract_raw").sum()
+    dist_strip_count = dist_out_df["match_source"].str.startswith("raw_strip").sum()
+    print(f"  Districts matched: {dist_matched_count} / {len(dist_out_df)}")
+    print(f"    - via extract from raw name: {dist_extract_count}")
+    print(f"    - via raw name strip: {dist_strip_count}")
+    print(f"    - via city fallback: {dist_city_fb_count}")
+    print(f"    - junk (skipped): {dist_junk_count}")
+
+    # --- Geocode City_District_Pairs ---
+    print("\nGeocoding city-district pairs ...")
+
+    dist_coord_map: dict[str, tuple[float, float, str]] = {}
+    for _, r in dist_out_df[dist_out_df["latitude"].notna()].iterrows():
+        dist_coord_map[r["区县供电单位名称"]] = (r["latitude"], r["longitude"], r["match_source"])
+
+    pair_rows = []
+    for _, row in city_district_pairs.iterrows():
+        raw_city = row["地市供电单位名称"]
+        raw_dist = row["区县供电单位名称"]
+
+        city_coords = city_coord_map.get(raw_city)
+        dist_coords = dist_coord_map.get(raw_dist)
+
+        pair_rows.append({
+            "地市供电单位名称": raw_city,
+            "city_latitude": city_coords[0] if city_coords else None,
+            "city_longitude": city_coords[1] if city_coords else None,
+            "city_match_source": city_coords[2] if city_coords else "unmatched",
+            "区县供电单位名称": raw_dist,
+            "district_latitude": dist_coords[0] if dist_coords else None,
+            "district_longitude": dist_coords[1] if dist_coords else None,
+            "district_match_source": dist_coords[2] if dist_coords else "unmatched",
         })
-    for _, row in dist_unmatched.iterrows():
-        unmatched_rows.append({
-            "level": "district",
-            "parsed_name": row["parsed_district_name"],
-            "parsed_city_name": row.get("parsed_city_name", ""),
-            "province": row["province"],
-        })
-    unmatched_df = pd.DataFrame(unmatched_rows) if unmatched_rows else pd.DataFrame(
-        columns=["level", "parsed_name", "parsed_city_name", "province"]
-    )
+
+    pairs_out_df = pd.DataFrame(pair_rows)
+    print(f"  Pairs: {len(pairs_out_df)} rows")
 
     # --- Write output ---
     with pd.ExcelWriter(OUTPUT_FILE) as writer:
-        city_coords_df[city_coords_df["latitude"].notna()].to_excel(
-            writer, sheet_name="City_Coordinates", index=False
-        )
-        dist_coords_df[dist_coords_df["latitude"].notna()].to_excel(
-            writer, sheet_name="District_Coordinates", index=False
-        )
-        unmatched_df.to_excel(writer, sheet_name="Unmatched", index=False)
+        city_out_df.to_excel(writer, sheet_name="Unique_Cities", index=False)
+        dist_out_df.to_excel(writer, sheet_name="Unique_Districts", index=False)
+        pairs_out_df.to_excel(writer, sheet_name="City_District_Pairs", index=False)
 
     print(f"\nSaved: {OUTPUT_FILE}")
-    print(f"  City_Coordinates: {len(city_matched)} rows")
-    print(f"  District_Coordinates: {len(dist_matched)} rows")
-    print(f"  Unmatched: {len(unmatched_df)} rows")
-
-    # Spot-check a few known cities
-    print("\n--- Spot checks ---")
-    spot_checks = ["成都", "武汉", "长沙", "杭州", "南京", "济南", "西安", "石柱", "延边"]
-    for name in spot_checks:
-        matches = city_coords_df[city_coords_df["parsed_city_name"] == name]
-        if len(matches) > 0:
-            r = matches.iloc[0]
-            print(f"  {name}: lat={r['latitude']}, lng={r['longitude']} ({r['match_source']})")
-        else:
-            # Check districts
-            d_matches = dist_coords_df[dist_coords_df["parsed_district_name"] == name]
-            if len(d_matches) > 0:
-                r = d_matches.iloc[0]
-                print(f"  {name} (district): lat={r['latitude']}, lng={r['longitude']} ({r['match_source']})")
-            else:
-                print(f"  {name}: not found in parsed data")
+    print(f"  Unique_Cities: {len(city_out_df)} rows ({city_matched_count} matched)")
+    print(f"  Unique_Districts: {len(dist_out_df)} rows ({dist_matched_count} matched)")
+    print(f"  City_District_Pairs: {len(pairs_out_df)} rows")
 
 
 if __name__ == "__main__":
